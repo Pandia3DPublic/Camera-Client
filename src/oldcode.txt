@@ -1,0 +1,385 @@
+
+//################################# jpg color compression ##########################################
+
+int compressColor(k4a::image& color, vector<uint8_t>& output, int resx, int resy, int quality)
+{
+	// Create OpenCV Mat from Kinect Image
+	//note this goes out of scope
+	Mat cvCol4 = Mat(Size(color.get_width_pixels(), color.get_height_pixels()), CV_8UC4, (void*)color.get_buffer(), Mat::AUTO_STEP);
+	Mat cvCol3 = Mat(Size(color.get_width_pixels(), color.get_height_pixels()), CV_8UC3); //todo check if cvCol3 is necessary for out of scope thingy
+	cvtColor(cvCol4, cvCol3, COLOR_BGRA2BGR); //remove alpha channel
+
+	//resize
+	Mat colResized = Mat(Size(resx, resy), CV_8UC3);
+	resize(cvCol3, colResized, Size(resx, resy), 0, 0, 1);
+
+	//encode color to jpg
+	inRange(quality, 0, 100, 95);
+	vector<int> paramCol = vector<int>(2);
+	paramCol[0] = IMWRITE_JPEG_QUALITY;
+	paramCol[1] = quality;//default(95) 0-100
+	imencode(".jpg", colResized, output, paramCol);
+
+	return int(sizeof(uint8_t) * output.size()); //bytecount
+}
+
+int compressColor(cv::Mat& color, vector<uint8_t>& output, int quality)
+{
+	inRange(quality, 0, 100, 95);
+	vector<int> paramCol = vector<int>(2);
+	paramCol[0] = IMWRITE_JPEG_QUALITY;
+	paramCol[1] = quality;//default(95) 0-100
+	imencode(".jpg", color, output, paramCol);
+
+	return int(sizeof(uint8_t) * output.size()); //bytecount
+}
+
+//################################# png depth compression ##########################################
+
+int compressDepth(k4a::image& depth, vector<uint8_t>& output, int resx, int resy, int level)
+{
+	// Create OpenCV Mat from Kinect Image
+	Mat cvDepth = Mat(Size(depth.get_width_pixels(), depth.get_height_pixels()), CV_16U, (void*)depth.get_buffer(), Mat::AUTO_STEP);
+
+	//resize
+	Mat depthResized = Mat(Size(resx, resy), CV_16U);
+	resize(cvDepth, depthResized, Size(resx, resy), 0, 0, 0); //no interpolation for depth because of artifacts
+
+	//encode depth to png
+	inRange(level, 0, 9, 1);
+	vector<int> paramDepth = vector<int>(2);
+	paramDepth[0] = IMWRITE_PNG_COMPRESSION;
+	paramDepth[1] = level; //0-9
+	imencode(".png", depthResized, output, paramDepth);
+
+	return int(sizeof(uint8_t) * output.size()); //bytecount
+}
+
+int compressDepth(k4a::image& depth, vector<uint8_t>& output, int level)
+{
+	// Create OpenCV Mat from Kinect Image
+	Mat cvDepth = Mat(Size(depth.get_width_pixels(), depth.get_height_pixels()), CV_16U, (void*)depth.get_buffer(), Mat::AUTO_STEP);
+
+	//encode depth to png
+	inRange(level, 0, 9, 1);
+	vector<int> paramDepth = vector<int>(2);
+	paramDepth[0] = IMWRITE_PNG_COMPRESSION;
+	paramDepth[1] = level; //0-9
+	imencode(".png", cvDepth, output, paramDepth);
+
+	return int(sizeof(uint8_t) * output.size()); //bytecount
+}
+
+int compressDepth(cv::Mat& depth, vector<uint8_t>& output, int level)
+{
+	inRange(level, 0, 9, 1);
+	vector<int> paramDepth = vector<int>(2);
+	paramDepth[0] = IMWRITE_PNG_COMPRESSION;
+	paramDepth[1] = level; //0-9
+	imencode(".png", depth, output, paramDepth);
+
+	return int(sizeof(uint8_t) * output.size()); //bytecount
+}
+
+//################################ Fast lossless depth image compression #########################################
+
+void EncodeVLE(int value, int* pBuffer, int &word, int &nibblesWritten)
+{
+	do
+	{
+		int nibble = value & 0x7; // lower 3 bits
+		if (value >>= 3) nibble |= 0x8; // more to come
+		word <<= 4;
+		word |= nibble;
+		if (++nibblesWritten == 8) // output word
+		{
+			*pBuffer++ = word;
+			nibblesWritten = 0;
+			word = 0;
+		}
+	} while (value);
+}
+
+int DecodeVLE(int &word, int* pBuffer, int &nibblesWritten)
+{
+	unsigned int nibble;
+	int value = 0, bits = 29;
+	do
+	{
+		if (!nibblesWritten)
+		{
+			word = *pBuffer++; // load word
+			nibblesWritten = 8;
+		}
+		nibble = word & 0xf0000000;
+		value |= (nibble << 1) >> bits;
+		word <<= 4;
+		nibblesWritten--;
+		bits -= 3;
+	} while (nibble & 0x80000000);
+	return value;
+}
+
+
+int CompressRVL(short* input, char* output, int numPixels)
+{
+	int* buffer = 0, * pBuffer = 0, word = 0, nibblesWritten = 0;
+
+	buffer = pBuffer = (int*)output;
+	nibblesWritten = 0;
+	short* end = input + numPixels;
+	short previous = 0;
+	while (input != end)
+	{
+		int zeros = 0, nonzeros = 0;
+		for (; (input != end) && !*input; input++, zeros++);
+		EncodeVLE(zeros, pBuffer, word, nibblesWritten); // number of zeros
+		for (short* p = input; (p != end) && *p++; nonzeros++);
+		EncodeVLE(nonzeros, pBuffer, word, nibblesWritten); // number of nonzeros
+		for (int i = 0; i < nonzeros; i++)
+		{
+			short current = *input++;
+			int delta = current - previous;
+			int positive = (delta << 1) ^ (delta >> 31);
+			EncodeVLE(positive, pBuffer, word, nibblesWritten); // nonzero value
+			previous = current;
+		}
+	}
+	if (nibblesWritten) // last few values
+		*pBuffer++ = word << 4 * (8 - nibblesWritten);
+	return int((char*)pBuffer - (char*)buffer); // num bytes
+}
+
+void DecompressRVL(char* input, short* output, int numPixels)
+{
+	int* buffer = 0, * pBuffer = 0, word = 0, nibblesWritten = 0;
+
+	buffer = pBuffer = (int*)input;
+	nibblesWritten = 0;
+	short current, previous = 0;
+	int numPixelsToDecode = numPixels;
+	while (numPixelsToDecode)
+	{
+		int zeros = DecodeVLE(word, pBuffer, nibblesWritten); // number of zeros
+		numPixelsToDecode -= zeros;
+		for (; zeros; zeros--)
+			*output++ = 0;
+		int nonzeros = DecodeVLE(word, pBuffer, nibblesWritten); // number of nonzeros
+		numPixelsToDecode -= nonzeros;
+		for (; nonzeros; nonzeros--)
+		{
+			int positive = DecodeVLE(word, pBuffer, nibblesWritten); // nonzero value
+			int delta = (positive >> 1) ^ -(positive & 1);
+			current = previous + delta;
+			*output++ = current;
+			previous = current;
+		}
+	}
+}
+
+
+
+//########################################### generate proto ################################################
+
+std::shared_ptr<proto::Intrinsics> generateProtoIntrColorLite(k4a::calibration& calibration)
+{
+	auto& param = calibration.color_camera_calibration.intrinsics.parameters.param;
+
+	std::shared_ptr<proto::Intrinsics> intr = std::make_shared<proto::Intrinsics>();
+	intr->set_width(calibration.color_camera_calibration.resolution_width);
+	intr->set_height(calibration.color_camera_calibration.resolution_height);
+	intr->set_cx(param.cx);
+	intr->set_cy(param.cy);
+	intr->set_fx(param.fx);
+	intr->set_fy(param.fy);
+
+	return intr;
+}
+
+std::shared_ptr<proto::Intrinsics> generateProtoIntrColor(k4a::calibration& calibration)
+{
+	auto& param = calibration.color_camera_calibration.intrinsics.parameters.param;
+
+	std::shared_ptr<proto::Intrinsics> intr = std::make_shared<proto::Intrinsics>();
+	intr->set_width(calibration.color_camera_calibration.resolution_width);
+	intr->set_height(calibration.color_camera_calibration.resolution_height);
+	intr->set_cx(param.cx);
+	intr->set_cy(param.cy);
+	intr->set_fx(param.fx);
+	intr->set_fy(param.fy);
+	intr->set_k1(param.k1);
+	intr->set_k2(param.k2);
+	intr->set_k3(param.k3);
+	intr->set_k4(param.k4);
+	intr->set_k5(param.k5);
+	intr->set_k6(param.k6);
+	intr->set_codx(param.codx);
+	intr->set_cody(param.cody);
+	intr->set_p1(param.p1);
+	intr->set_p2(param.p2);
+	intr->set_metric_radius(param.metric_radius);
+
+	return intr;
+}
+
+std::shared_ptr<proto::Intrinsics> generateProtoIntrDepth(k4a::calibration& calibration)
+{
+	auto& param = calibration.depth_camera_calibration.intrinsics.parameters.param;
+
+	std::shared_ptr<proto::Intrinsics> intr = std::make_shared<proto::Intrinsics>();
+	intr->set_width(calibration.depth_camera_calibration.resolution_width);
+	intr->set_height(calibration.depth_camera_calibration.resolution_height);
+	intr->set_cx(param.cx);
+	intr->set_cy(param.cy);
+	intr->set_fx(param.fx);
+	intr->set_fy(param.fy);
+	intr->set_k1(param.k1);
+	intr->set_k2(param.k2);
+	intr->set_k3(param.k3);
+	intr->set_k4(param.k4);
+	intr->set_k5(param.k5);
+	intr->set_k6(param.k6);
+	intr->set_codx(param.codx);
+	intr->set_cody(param.cody);
+	intr->set_p1(param.p1);
+	intr->set_p2(param.p2);
+	intr->set_metric_radius(param.metric_radius);
+
+	return intr;
+}
+
+
+std::shared_ptr<proto::FrameData> generateProtoCompressedRVL(std::list <std::shared_ptr<k4a::capture>>& capturebuffer)
+{
+	Timer t3("package ready", microsecond);
+	auto capture = getSingleCap(capturebuffer);
+
+	k4a::image color = capture->get_color_image();
+	k4a::image depth = capture->get_depth_image();
+
+	//compress color
+	int resx = 640;
+	int resy = 480;
+	vector<uint8_t> colorsmall;
+	Timer t("compress color", microsecond);
+	compressColor(color, colorsmall, resx, resy, 90);
+	t.~Timer();
+
+	//compress depth
+	Timer t2("compress depth", microsecond);
+	char* depthsmall = new char[depth.get_size()]; //set compressed image buffer size to max value (worst case same as uncompressed)
+	int bytecount = ff_librvldepth_compress_rvl((short*)depth.get_buffer(), depthsmall, depth.get_width_pixels() * depth.get_height_pixels());
+	t2.~Timer();
+
+	// protobuf message init
+	std::shared_ptr<proto::FrameData> framedata = std::make_shared<proto::FrameData>();
+	proto::ColorImage* colorImg = new proto::ColorImage; //protobuf will take care of deleting as long as we do not call release_*
+	proto::DepthImage* depthImg = new proto::DepthImage;
+
+	colorImg->set_data((void*)colorsmall.data(), sizeof(uint8_t) * colorsmall.size());
+	colorImg->set_width(resx);
+	colorImg->set_height(resy);
+	colorImg->set_size(sizeof(uint8_t) * colorsmall.size());
+	colorImg->set_timestamp(color.get_device_timestamp().count());
+	colorImg->set_stridebytes(color.get_stride_bytes());
+	colorImg->set_format("JPG");
+
+	depthImg->set_data((void*)depthsmall, bytecount);
+	depthImg->set_width(depth.get_width_pixels());
+	depthImg->set_height(depth.get_height_pixels());
+	depthImg->set_size(bytecount);
+	depthImg->set_timestamp(depth.get_device_timestamp().count());
+	depthImg->set_stridebytes(depth.get_stride_bytes());
+	depthImg->set_format("RVL");
+
+	framedata->set_allocated_colorimage(colorImg);
+	framedata->set_allocated_depthimage(depthImg);
+
+	delete[] depthsmall;
+	return framedata;
+}
+
+//get capture from capturebuffer, compress images, generate and return framedata proto-message, unserialized
+std::shared_ptr<proto::FrameData> generateProtoCompressed(std::list <std::shared_ptr<k4a::capture>>& capturebuffer, k4a::transformation& transform)
+{
+	Timer timer("generateProtoCompressed", millisecond);
+	// Get a capture
+	auto capture = getSingleCap(capturebuffer);
+
+	//get color and aligned depth image
+	k4a::image color = capture->get_color_image();
+	k4a::image depth = capture->get_depth_image();
+	k4a::image transDepth = transform.depth_image_to_color_camera(depth);
+
+	//compress images
+	int resx = 640;
+	int resy = 480;
+	vector<uint8_t> colorsmall;
+	vector<uint8_t> depthsmall;
+	compressColor(color, colorsmall, resx, resy);
+	compressDepth(transDepth, depthsmall);
+
+	// protobuf message init
+	std::shared_ptr<proto::FrameData> framedata = std::make_shared<proto::FrameData>();
+	proto::ColorImage* colorImg = new proto::ColorImage; //protobuf will take care of deleting as long as we do not call release_*
+	proto::DepthImage* depthImg = new proto::DepthImage;
+
+	colorImg->set_data((void*)colorsmall.data(), sizeof(uint8_t) * colorsmall.size());
+	colorImg->set_width(resx);
+	colorImg->set_height(resy);
+	colorImg->set_size(sizeof(uint8_t) * colorsmall.size());
+	colorImg->set_timestamp(color.get_device_timestamp().count());
+	colorImg->set_stridebytes(color.get_stride_bytes());
+	colorImg->set_format("JPG");
+
+	depthImg->set_data((void*)depthsmall.data(), sizeof(uint8_t) * depthsmall.size());
+	depthImg->set_width(resx);
+	depthImg->set_height(resy);
+	depthImg->set_size(sizeof(uint8_t) * depthsmall.size());
+	depthImg->set_timestamp(depth.get_device_timestamp().count());
+	depthImg->set_stridebytes(depth.get_stride_bytes());
+	depthImg->set_format("PNG");
+
+	framedata->set_allocated_colorimage(colorImg);
+	framedata->set_allocated_depthimage(depthImg);
+
+	return framedata;
+}
+
+//get capture from capturebuffer, generate and return framedata proto-message, unserialized
+std::shared_ptr<proto::FrameData> generateProto(std::list <std::shared_ptr<k4a::capture>>& capturebuffer, k4a::transformation& transform)
+{
+	// Get a capture
+	auto capture = getSingleCap(capturebuffer);
+
+	//get color and aligned depth image
+	k4a::image color = capture->get_color_image();
+	k4a::image depth = capture->get_depth_image();
+	k4a::image transDepth = transform.depth_image_to_color_camera(depth);
+
+	// protobuf message init
+	std::shared_ptr<proto::FrameData> framedata = std::make_shared<proto::FrameData>();
+	proto::ColorImage* colorImg = new proto::ColorImage; //protobuf will take care of deleting as long as we do not call release_*
+	proto::DepthImage* depthImg = new proto::DepthImage;
+
+	colorImg->set_data((void*)color.get_buffer(), color.get_size());
+	colorImg->set_width(color.get_width_pixels());
+	colorImg->set_height(color.get_height_pixels());
+	colorImg->set_size(color.get_size());
+	colorImg->set_timestamp(color.get_device_timestamp().count());
+	colorImg->set_stridebytes(color.get_stride_bytes());
+	colorImg->set_format("BGRA32");
+
+	depthImg->set_data((void*)transDepth.get_buffer(), transDepth.get_size());
+	depthImg->set_width(transDepth.get_width_pixels());
+	depthImg->set_height(transDepth.get_height_pixels());
+	depthImg->set_size(transDepth.get_size());
+	depthImg->set_timestamp(depth.get_device_timestamp().count());
+	depthImg->set_stridebytes(transDepth.get_stride_bytes());
+	depthImg->set_format("DEPTH16");
+
+	framedata->set_allocated_colorimage(colorImg);
+	framedata->set_allocated_depthimage(depthImg);
+
+	return framedata;
+}

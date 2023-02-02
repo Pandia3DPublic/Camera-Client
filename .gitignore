@@ -1,0 +1,3 @@
+.vs/*
+CMakeBuilds/*
+src/cmakedefines.h
